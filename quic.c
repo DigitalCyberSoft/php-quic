@@ -38,6 +38,155 @@ static zend_object_handlers quic_connection_handlers;
 static zend_object_handlers quic_stream_handlers;
 
 /* ----------------------------------------------------------------
+ * SOCKS5 UDP relay BIO filter
+ * Wraps outgoing datagrams with RFC 1928 UDP header, strips on receive.
+ * Header: 2 bytes RSV (0x0000) + 1 byte FRAG (0x00) + ATYP + DST.ADDR + DST.PORT
+ * ---------------------------------------------------------------- */
+
+typedef struct {
+	struct sockaddr_storage target_addr;
+	socklen_t target_addr_len;
+	uint8_t header[22]; /* max: 2 RSV + 1 FRAG + 1 ATYP + 16 IPv6 + 2 port = 22 */
+	size_t header_len;
+} socks5_bio_data;
+
+static int socks5_bio_write_ex(BIO *bio, const char *data, size_t datal, size_t *written)
+{
+	BIO *next = BIO_next(bio);
+	if (!next) return 0;
+
+	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
+
+	/* Prepend SOCKS5 UDP header to outgoing datagram */
+	size_t total = s5->header_len + datal;
+	char *buf = OPENSSL_malloc(total);
+	if (!buf) return 0;
+
+	memcpy(buf, s5->header, s5->header_len);
+	memcpy(buf + s5->header_len, data, datal);
+
+	int ret = BIO_write_ex(next, buf, total, written);
+	OPENSSL_free(buf);
+
+	/* Adjust written count to exclude our header */
+	if (ret && *written >= s5->header_len)
+		*written -= s5->header_len;
+
+	return ret;
+}
+
+static int socks5_bio_read_ex(BIO *bio, char *data, size_t datal, size_t *readbytes)
+{
+	BIO *next = BIO_next(bio);
+	if (!next) return 0;
+
+	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
+
+	/* Read into a temp buffer large enough for header + payload */
+	size_t total = s5->header_len + datal;
+	char *buf = OPENSSL_malloc(total);
+	if (!buf) return 0;
+
+	size_t got = 0;
+	int ret = BIO_read_ex(next, buf, total, &got);
+	if (!ret || got <= s5->header_len) {
+		OPENSSL_free(buf);
+		*readbytes = 0;
+		return ret;
+	}
+
+	/* Strip SOCKS5 UDP header — the header length varies by ATYP in the response,
+	 * but for simplicity parse the actual response header */
+	size_t resp_hdr_len = 0;
+	if (got >= 4) {
+		uint8_t atyp = (uint8_t)buf[3];
+		if (atyp == 0x01)       resp_hdr_len = 10; /* IPv4: 2+1+1+4+2 */
+		else if (atyp == 0x04)  resp_hdr_len = 22; /* IPv6: 2+1+1+16+2 */
+		else if (atyp == 0x03 && got >= 5) resp_hdr_len = 4 + 1 + (uint8_t)buf[4] + 2; /* domain */
+		else resp_hdr_len = s5->header_len; /* fallback */
+	} else {
+		resp_hdr_len = s5->header_len;
+	}
+
+	if (got <= resp_hdr_len) {
+		OPENSSL_free(buf);
+		*readbytes = 0;
+		return ret;
+	}
+
+	size_t payload_len = got - resp_hdr_len;
+	if (payload_len > datal) payload_len = datal;
+	memcpy(data, buf + resp_hdr_len, payload_len);
+	*readbytes = payload_len;
+
+	OPENSSL_free(buf);
+	return ret;
+}
+
+static long socks5_bio_ctrl(BIO *bio, int cmd, long larg, void *parg)
+{
+	BIO *next = BIO_next(bio);
+	if (!next) return 0;
+	return BIO_ctrl(next, cmd, larg, parg);
+}
+
+static int socks5_bio_create(BIO *bio)
+{
+	BIO_set_init(bio, 1);
+	return 1;
+}
+
+static int socks5_bio_destroy(BIO *bio)
+{
+	if (bio) {
+		socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
+		if (s5) {
+			OPENSSL_free(s5);
+			BIO_set_data(bio, NULL);
+		}
+	}
+	return 1;
+}
+
+static BIO_METHOD *socks5_bio_method = NULL;
+
+static BIO_METHOD *get_socks5_bio_method(void)
+{
+	if (!socks5_bio_method) {
+		socks5_bio_method = BIO_meth_new(BIO_TYPE_FILTER | BIO_get_new_index(),
+			"socks5_udp_filter");
+		BIO_meth_set_write_ex(socks5_bio_method, socks5_bio_write_ex);
+		BIO_meth_set_read_ex(socks5_bio_method, socks5_bio_read_ex);
+		BIO_meth_set_ctrl(socks5_bio_method, socks5_bio_ctrl);
+		BIO_meth_set_create(socks5_bio_method, socks5_bio_create);
+		BIO_meth_set_destroy(socks5_bio_method, socks5_bio_destroy);
+	}
+	return socks5_bio_method;
+}
+
+/* Build the SOCKS5 UDP header for a given target sockaddr */
+static size_t socks5_build_header(uint8_t *header, struct sockaddr_storage *addr)
+{
+	header[0] = 0x00; /* RSV */
+	header[1] = 0x00;
+	header[2] = 0x00; /* FRAG */
+
+	if (addr->ss_family == AF_INET) {
+		struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+		header[3] = 0x01; /* ATYP IPv4 */
+		memcpy(header + 4, &sin->sin_addr, 4);
+		memcpy(header + 8, &sin->sin_port, 2);
+		return 10;
+	} else {
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+		header[3] = 0x04; /* ATYP IPv6 */
+		memcpy(header + 4, &sin6->sin6_addr, 16);
+		memcpy(header + 20, &sin6->sin6_port, 2);
+		return 22;
+	}
+}
+
+/* ----------------------------------------------------------------
  * QuicConnection object
  * ---------------------------------------------------------------- */
 
@@ -48,6 +197,7 @@ typedef struct {
 	char *host;
 	char *peer_name;
 	int port;
+	char *socks5_proxy;  /* "host:port" for SOCKS5 UDP relay */
 	zend_bool connected;
 	zend_bool verify_peer;
 	zend_bool verify_peer_name;
@@ -216,6 +366,10 @@ static void quic_connection_free(zend_object *object)
 		efree(conn->peer_name);
 		conn->peer_name = NULL;
 	}
+	if (conn->socks5_proxy) {
+		efree(conn->socks5_proxy);
+		conn->socks5_proxy = NULL;
+	}
 
 	zend_object_std_dtor(&conn->std);
 }
@@ -233,6 +387,7 @@ static zend_object *quic_connection_create(zend_class_entry *ce)
 	conn->fd = -1;
 	conn->host = NULL;
 	conn->peer_name = NULL;
+	conn->socks5_proxy = NULL;
 	conn->port = 0;
 	conn->connected = 0;
 	conn->verify_peer = 1;
@@ -421,6 +576,12 @@ PHP_METHOD(QuicConnection, __construct)
 				RETURN_THROWS();
 			}
 		}
+
+		/* socks5_proxy - "host:port" of SOCKS5 UDP relay for tunneling QUIC */
+		opt_val = zend_hash_str_find(Z_ARRVAL_P(options), "socks5_proxy", sizeof("socks5_proxy") - 1);
+		if (opt_val && Z_TYPE_P(opt_val) == IS_STRING && Z_STRLEN_P(opt_val) > 0) {
+			conn->socks5_proxy = estrndup(Z_STRVAL_P(opt_val), Z_STRLEN_P(opt_val));
+		}
 	}
 
 	/* Set verification mode */
@@ -469,15 +630,45 @@ PHP_METHOD(QuicConnection, connect)
 	 * We stored the ctx, so check if we need to get timeout from the object.
 	 * For simplicity, use the default or parse from the zval stored. */
 
-	/* Resolve hostname */
+	/* Resolve the real target */
 	if (quic_resolve_host(conn->host, conn->port, &peer_addr, &peer_addr_len) != 0) {
 		zend_throw_exception_ex(spl_ce_RuntimeException, 0,
 			"Failed to resolve host: %s", conn->host);
 		RETURN_THROWS();
 	}
 
+	/* Determine where the UDP socket should connect:
+	 * - Direct: connect to peer_addr (the target)
+	 * - SOCKS5: connect to the relay address */
+	struct sockaddr_storage connect_addr;
+	socklen_t connect_addr_len;
+
+	if (conn->socks5_proxy) {
+		/* Parse relay "host:port" */
+		char relay_buf[256];
+		strncpy(relay_buf, conn->socks5_proxy, sizeof(relay_buf) - 1);
+		relay_buf[sizeof(relay_buf) - 1] = '\0';
+		char *colon = strrchr(relay_buf, ':');
+		if (!colon) {
+			zend_throw_exception(spl_ce_RuntimeException,
+				"Invalid socks5_proxy format, expected host:port", 0);
+			RETURN_THROWS();
+		}
+		*colon = '\0';
+		int relay_port = atoi(colon + 1);
+
+		if (quic_resolve_host(relay_buf, relay_port, &connect_addr, &connect_addr_len) != 0) {
+			zend_throw_exception_ex(spl_ce_RuntimeException, 0,
+				"Failed to resolve SOCKS5 relay: %s", relay_buf);
+			RETURN_THROWS();
+		}
+	} else {
+		memcpy(&connect_addr, &peer_addr, peer_addr_len);
+		connect_addr_len = peer_addr_len;
+	}
+
 	/* Create UDP socket */
-	fd = socket(peer_addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
+	fd = socket(connect_addr.ss_family, SOCK_DGRAM, IPPROTO_UDP);
 	if (fd < 0) {
 		zend_throw_exception_ex(spl_ce_RuntimeException, 0,
 			"Failed to create UDP socket: %s", strerror(errno));
@@ -524,15 +715,36 @@ PHP_METHOD(QuicConnection, connect)
 		RETURN_THROWS();
 	}
 
-	/* Copy sockaddr into BIO_ADDR.
-	 * We need to use the connect() approach or set the peer address. */
-	if (connect(fd, (struct sockaddr *)&peer_addr, peer_addr_len) < 0) {
+	/* Connect UDP socket to target (direct) or relay (SOCKS5) */
+	if (connect(fd, (struct sockaddr *)&connect_addr, connect_addr_len) < 0) {
 		BIO_ADDR_free(bio_addr);
 		BIO_free(bio);
 		close(fd);
 		zend_throw_exception_ex(spl_ce_RuntimeException, 0,
 			"Failed to connect UDP socket: %s", strerror(errno));
 		RETURN_THROWS();
+	}
+
+	/* If SOCKS5, insert BIO filter that wraps/unwraps UDP relay headers */
+	if (conn->socks5_proxy) {
+		BIO *filter = BIO_new(get_socks5_bio_method());
+		if (!filter) {
+			BIO_ADDR_free(bio_addr);
+			BIO_free(bio);
+			close(fd);
+			zend_throw_exception(spl_ce_RuntimeException,
+				"Failed to create SOCKS5 BIO filter", 0);
+			RETURN_THROWS();
+		}
+
+		socks5_bio_data *s5 = OPENSSL_zalloc(sizeof(socks5_bio_data));
+		memcpy(&s5->target_addr, &peer_addr, peer_addr_len);
+		s5->target_addr_len = peer_addr_len;
+		s5->header_len = socks5_build_header(s5->header, &peer_addr);
+		BIO_set_data(filter, s5);
+
+		/* Chain: SSL -> socks5_filter -> dgram_bio */
+		bio = BIO_push(filter, bio);
 	}
 
 	SSL_set_bio(conn->ssl, bio, bio);
@@ -1430,6 +1642,10 @@ PHP_MINIT_FUNCTION(quic)
 
 PHP_MSHUTDOWN_FUNCTION(quic)
 {
+	if (socks5_bio_method) {
+		BIO_meth_free(socks5_bio_method);
+		socks5_bio_method = NULL;
+	}
 	return SUCCESS;
 }
 
