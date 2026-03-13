@@ -20,6 +20,13 @@ This extension uses the [OpenSSL 3.2+](https://www.openssl.org/) native QUIC cli
 
 ## Installation
 
+### From COPR (Fedora/RHEL)
+
+```bash
+sudo dnf copr enable reversejames/php-quic
+sudo dnf install php-quic
+```
+
 ### From Source
 
 ```bash
