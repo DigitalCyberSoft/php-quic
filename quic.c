@@ -37,6 +37,8 @@ static zend_class_entry *quic_stream_ce;
 static zend_object_handlers quic_connection_handlers;
 static zend_object_handlers quic_stream_handlers;
 
+static int quic_resolve_host(const char *host, int port, struct sockaddr_storage *addr, socklen_t *addrlen);
+
 /* ----------------------------------------------------------------
  * SOCKS5 UDP relay BIO filter
  * Wraps outgoing datagrams with RFC 1928 UDP header, strips on receive.
@@ -187,6 +189,240 @@ static size_t socks5_build_header(uint8_t *header, struct sockaddr_storage *addr
 }
 
 /* ----------------------------------------------------------------
+ * SOCKS5 TCP handshake: auth + UDP ASSOCIATE
+ *
+ * Performs the full RFC 1928 handshake over a TCP connection to the
+ * SOCKS5 proxy, then issues UDP ASSOCIATE. On success, writes the
+ * relay address into relay_addr/relay_addr_len and returns the TCP
+ * control socket fd (caller must keep it open).
+ * Returns -1 on failure (sets errmsg).
+ * ---------------------------------------------------------------- */
+
+static int socks5_handshake(const char *proxy_host, int proxy_port,
+	const char *username, const char *password,
+	struct sockaddr_storage *bind_addr, socklen_t bind_addr_len,
+	struct sockaddr_storage *relay_addr, socklen_t *relay_addr_len,
+	char *errmsg, size_t errmsg_size)
+{
+	int tcp_fd = -1;
+	struct sockaddr_storage proxy_addr;
+	socklen_t proxy_addr_len;
+	uint8_t buf[512];
+	ssize_t n;
+
+	/* Resolve proxy */
+	if (quic_resolve_host(proxy_host, proxy_port, &proxy_addr, &proxy_addr_len) != 0) {
+		snprintf(errmsg, errmsg_size, "Failed to resolve SOCKS5 proxy: %s", proxy_host);
+		return -1;
+	}
+
+	/* TCP connect to proxy */
+	tcp_fd = socket(proxy_addr.ss_family, SOCK_STREAM, IPPROTO_TCP);
+	if (tcp_fd < 0) {
+		snprintf(errmsg, errmsg_size, "Failed to create TCP socket: %s", strerror(errno));
+		return -1;
+	}
+
+	struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+	setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+	setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+	if (connect(tcp_fd, (struct sockaddr *)&proxy_addr, proxy_addr_len) < 0) {
+		snprintf(errmsg, errmsg_size, "Failed to connect to SOCKS5 proxy: %s", strerror(errno));
+		close(tcp_fd);
+		return -1;
+	}
+
+	/* --- Auth negotiation (RFC 1928 section 3) --- */
+	int has_auth = (username && password && strlen(username) > 0);
+
+	if (has_auth) {
+		/* Offer no-auth (0x00) and username/password (0x02) */
+		buf[0] = 0x05; /* VER */
+		buf[1] = 0x02; /* NMETHODS */
+		buf[2] = 0x00; /* NO AUTH */
+		buf[3] = 0x02; /* USERNAME/PASSWORD */
+		if (send(tcp_fd, buf, 4, 0) != 4) goto io_err;
+	} else {
+		/* Offer no-auth only */
+		buf[0] = 0x05;
+		buf[1] = 0x01;
+		buf[2] = 0x00;
+		if (send(tcp_fd, buf, 3, 0) != 3) goto io_err;
+	}
+
+	/* Read method selection */
+	n = recv(tcp_fd, buf, 2, MSG_WAITALL);
+	if (n != 2 || buf[0] != 0x05) {
+		snprintf(errmsg, errmsg_size, "SOCKS5 proxy returned invalid version");
+		close(tcp_fd);
+		return -1;
+	}
+
+	if (buf[1] == 0xFF) {
+		snprintf(errmsg, errmsg_size, "SOCKS5 proxy: no acceptable auth method");
+		close(tcp_fd);
+		return -1;
+	}
+
+	/* Username/password auth (RFC 1929) */
+	if (buf[1] == 0x02) {
+		if (!has_auth) {
+			snprintf(errmsg, errmsg_size, "SOCKS5 proxy requires authentication");
+			close(tcp_fd);
+			return -1;
+		}
+		size_t ulen = strlen(username);
+		size_t plen = strlen(password);
+		if (ulen > 255 || plen > 255) {
+			snprintf(errmsg, errmsg_size, "SOCKS5 username/password too long");
+			close(tcp_fd);
+			return -1;
+		}
+		uint8_t *p = buf;
+		*p++ = 0x01; /* subnegotiation version */
+		*p++ = (uint8_t)ulen;
+		memcpy(p, username, ulen); p += ulen;
+		*p++ = (uint8_t)plen;
+		memcpy(p, password, plen); p += plen;
+		if (send(tcp_fd, buf, (size_t)(p - buf), 0) != (ssize_t)(p - buf)) goto io_err;
+
+		n = recv(tcp_fd, buf, 2, MSG_WAITALL);
+		if (n != 2 || buf[1] != 0x00) {
+			snprintf(errmsg, errmsg_size, "SOCKS5 authentication failed");
+			close(tcp_fd);
+			return -1;
+		}
+	} else if (buf[1] != 0x00) {
+		snprintf(errmsg, errmsg_size, "SOCKS5 proxy selected unsupported auth method 0x%02x", buf[1]);
+		close(tcp_fd);
+		return -1;
+	}
+
+	/* --- UDP ASSOCIATE request (RFC 1928 section 4) ---
+	 * DST.ADDR/DST.PORT = our local bind address so proxy knows where
+	 * to expect UDP from. If we don't know yet, use 0.0.0.0:0. */
+	{
+		uint8_t *p = buf;
+		*p++ = 0x05; /* VER */
+		*p++ = 0x03; /* CMD = UDP ASSOCIATE */
+		*p++ = 0x00; /* RSV */
+
+		if (bind_addr && bind_addr->ss_family == AF_INET) {
+			struct sockaddr_in *sin = (struct sockaddr_in *)bind_addr;
+			*p++ = 0x01; /* ATYP IPv4 */
+			memcpy(p, &sin->sin_addr, 4); p += 4;
+			memcpy(p, &sin->sin_port, 2); p += 2;
+		} else if (bind_addr && bind_addr->ss_family == AF_INET6) {
+			struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)bind_addr;
+			*p++ = 0x04; /* ATYP IPv6 */
+			memcpy(p, &sin6->sin6_addr, 16); p += 16;
+			memcpy(p, &sin6->sin6_port, 2); p += 2;
+		} else {
+			/* Unknown / unbound — send 0.0.0.0:0 */
+			*p++ = 0x01;
+			memset(p, 0, 6); p += 6;
+		}
+
+		if (send(tcp_fd, buf, (size_t)(p - buf), 0) != (ssize_t)(p - buf)) goto io_err;
+	}
+
+	/* --- Read UDP ASSOCIATE reply --- */
+	n = recv(tcp_fd, buf, 4, MSG_WAITALL);
+	if (n != 4 || buf[0] != 0x05) {
+		snprintf(errmsg, errmsg_size, "SOCKS5 UDP ASSOCIATE: invalid reply");
+		close(tcp_fd);
+		return -1;
+	}
+	if (buf[1] != 0x00) {
+		const char *reason;
+		switch (buf[1]) {
+			case 0x01: reason = "general failure"; break;
+			case 0x02: reason = "connection not allowed"; break;
+			case 0x03: reason = "network unreachable"; break;
+			case 0x04: reason = "host unreachable"; break;
+			case 0x05: reason = "connection refused"; break;
+			case 0x07: reason = "command not supported"; break;
+			case 0x08: reason = "address type not supported"; break;
+			default:   reason = "unknown error"; break;
+		}
+		snprintf(errmsg, errmsg_size, "SOCKS5 UDP ASSOCIATE failed: %s (0x%02x)", reason, buf[1]);
+		close(tcp_fd);
+		return -1;
+	}
+
+	/* Parse BND.ADDR + BND.PORT — the relay endpoint */
+	uint8_t atyp = buf[3];
+	if (atyp == 0x01) {
+		/* IPv4 */
+		uint8_t addr_buf[6]; /* 4 addr + 2 port */
+		n = recv(tcp_fd, addr_buf, 6, MSG_WAITALL);
+		if (n != 6) goto io_err;
+		struct sockaddr_in *sin = (struct sockaddr_in *)relay_addr;
+		memset(sin, 0, sizeof(*sin));
+		sin->sin_family = AF_INET;
+		memcpy(&sin->sin_addr, addr_buf, 4);
+		memcpy(&sin->sin_port, addr_buf + 4, 2);
+		*relay_addr_len = sizeof(struct sockaddr_in);
+
+		/* If relay address is 0.0.0.0, use the proxy's address instead */
+		if (sin->sin_addr.s_addr == INADDR_ANY) {
+			if (proxy_addr.ss_family == AF_INET) {
+				sin->sin_addr = ((struct sockaddr_in *)&proxy_addr)->sin_addr;
+			}
+		}
+	} else if (atyp == 0x04) {
+		/* IPv6 */
+		uint8_t addr_buf[18]; /* 16 addr + 2 port */
+		n = recv(tcp_fd, addr_buf, 18, MSG_WAITALL);
+		if (n != 18) goto io_err;
+		struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)relay_addr;
+		memset(sin6, 0, sizeof(*sin6));
+		sin6->sin6_family = AF_INET6;
+		memcpy(&sin6->sin6_addr, addr_buf, 16);
+		memcpy(&sin6->sin6_port, addr_buf + 16, 2);
+		*relay_addr_len = sizeof(struct sockaddr_in6);
+
+		/* If relay address is ::, use the proxy's address instead */
+		static const uint8_t zeroes[16] = {0};
+		if (memcmp(&sin6->sin6_addr, zeroes, 16) == 0) {
+			if (proxy_addr.ss_family == AF_INET6) {
+				sin6->sin6_addr = ((struct sockaddr_in6 *)&proxy_addr)->sin6_addr;
+			}
+		}
+	} else if (atyp == 0x03) {
+		/* Domain name — unusual for UDP ASSOCIATE but handle it */
+		uint8_t dlen;
+		n = recv(tcp_fd, &dlen, 1, MSG_WAITALL);
+		if (n != 1) goto io_err;
+		char domain[256];
+		n = recv(tcp_fd, domain, dlen, MSG_WAITALL);
+		if (n != dlen) goto io_err;
+		domain[dlen] = '\0';
+		uint8_t port_buf[2];
+		n = recv(tcp_fd, port_buf, 2, MSG_WAITALL);
+		if (n != 2) goto io_err;
+		int rport = (port_buf[0] << 8) | port_buf[1];
+		if (quic_resolve_host(domain, rport, relay_addr, relay_addr_len) != 0) {
+			snprintf(errmsg, errmsg_size, "Failed to resolve SOCKS5 relay address: %s", domain);
+			close(tcp_fd);
+			return -1;
+		}
+	} else {
+		snprintf(errmsg, errmsg_size, "SOCKS5 UDP ASSOCIATE: unsupported ATYP 0x%02x", atyp);
+		close(tcp_fd);
+		return -1;
+	}
+
+	return tcp_fd;
+
+io_err:
+	snprintf(errmsg, errmsg_size, "SOCKS5 handshake I/O error: %s", strerror(errno));
+	close(tcp_fd);
+	return -1;
+}
+
+/* ----------------------------------------------------------------
  * QuicConnection object
  * ---------------------------------------------------------------- */
 
@@ -197,7 +433,10 @@ typedef struct {
 	char *host;
 	char *peer_name;
 	int port;
-	char *socks5_proxy;  /* "host:port" for SOCKS5 UDP relay */
+	char *socks5_proxy;  /* "host:port" of SOCKS5 proxy */
+	char *socks5_username;
+	char *socks5_password;
+	int socks5_ctrl_fd;  /* TCP control socket — must stay open for relay lifetime */
 	zend_bool connected;
 	zend_bool verify_peer;
 	zend_bool verify_peer_name;
@@ -370,6 +609,18 @@ static void quic_connection_free(zend_object *object)
 		efree(conn->socks5_proxy);
 		conn->socks5_proxy = NULL;
 	}
+	if (conn->socks5_username) {
+		efree(conn->socks5_username);
+		conn->socks5_username = NULL;
+	}
+	if (conn->socks5_password) {
+		efree(conn->socks5_password);
+		conn->socks5_password = NULL;
+	}
+	if (conn->socks5_ctrl_fd >= 0) {
+		close(conn->socks5_ctrl_fd);
+		conn->socks5_ctrl_fd = -1;
+	}
 
 	zend_object_std_dtor(&conn->std);
 }
@@ -388,6 +639,9 @@ static zend_object *quic_connection_create(zend_class_entry *ce)
 	conn->host = NULL;
 	conn->peer_name = NULL;
 	conn->socks5_proxy = NULL;
+	conn->socks5_username = NULL;
+	conn->socks5_password = NULL;
+	conn->socks5_ctrl_fd = -1;
 	conn->port = 0;
 	conn->connected = 0;
 	conn->verify_peer = 1;
@@ -577,10 +831,20 @@ PHP_METHOD(QuicConnection, __construct)
 			}
 		}
 
-		/* socks5_proxy - "host:port" of SOCKS5 UDP relay for tunneling QUIC */
+		/* socks5_proxy - "host:port" of SOCKS5 proxy for tunneling QUIC over UDP relay */
 		opt_val = zend_hash_str_find(Z_ARRVAL_P(options), "socks5_proxy", sizeof("socks5_proxy") - 1);
 		if (opt_val && Z_TYPE_P(opt_val) == IS_STRING && Z_STRLEN_P(opt_val) > 0) {
 			conn->socks5_proxy = estrndup(Z_STRVAL_P(opt_val), Z_STRLEN_P(opt_val));
+		}
+
+		/* socks5_username / socks5_password - optional auth for SOCKS5 proxy */
+		opt_val = zend_hash_str_find(Z_ARRVAL_P(options), "socks5_username", sizeof("socks5_username") - 1);
+		if (opt_val && Z_TYPE_P(opt_val) == IS_STRING && Z_STRLEN_P(opt_val) > 0) {
+			conn->socks5_username = estrndup(Z_STRVAL_P(opt_val), Z_STRLEN_P(opt_val));
+		}
+		opt_val = zend_hash_str_find(Z_ARRVAL_P(options), "socks5_password", sizeof("socks5_password") - 1);
+		if (opt_val && Z_TYPE_P(opt_val) == IS_STRING && Z_STRLEN_P(opt_val) > 0) {
+			conn->socks5_password = estrndup(Z_STRVAL_P(opt_val), Z_STRLEN_P(opt_val));
 		}
 	}
 
@@ -639,29 +903,37 @@ PHP_METHOD(QuicConnection, connect)
 
 	/* Determine where the UDP socket should connect:
 	 * - Direct: connect to peer_addr (the target)
-	 * - SOCKS5: connect to the relay address */
+	 * - SOCKS5: perform TCP handshake, get relay address from proxy */
 	struct sockaddr_storage connect_addr;
 	socklen_t connect_addr_len;
 
 	if (conn->socks5_proxy) {
-		/* Parse relay "host:port" */
-		char relay_buf[256];
-		strncpy(relay_buf, conn->socks5_proxy, sizeof(relay_buf) - 1);
-		relay_buf[sizeof(relay_buf) - 1] = '\0';
-		char *colon = strrchr(relay_buf, ':');
+		/* Parse proxy "host:port" */
+		char proxy_buf[256];
+		strncpy(proxy_buf, conn->socks5_proxy, sizeof(proxy_buf) - 1);
+		proxy_buf[sizeof(proxy_buf) - 1] = '\0';
+		char *colon = strrchr(proxy_buf, ':');
 		if (!colon) {
 			zend_throw_exception(spl_ce_RuntimeException,
 				"Invalid socks5_proxy format, expected host:port", 0);
 			RETURN_THROWS();
 		}
 		*colon = '\0';
-		int relay_port = atoi(colon + 1);
+		int proxy_port = atoi(colon + 1);
 
-		if (quic_resolve_host(relay_buf, relay_port, &connect_addr, &connect_addr_len) != 0) {
-			zend_throw_exception_ex(spl_ce_RuntimeException, 0,
-				"Failed to resolve SOCKS5 relay: %s", relay_buf);
+		/* Perform SOCKS5 TCP handshake + UDP ASSOCIATE */
+		char errmsg[512];
+		int ctrl_fd = socks5_handshake(
+			proxy_buf, proxy_port,
+			conn->socks5_username, conn->socks5_password,
+			NULL, 0,  /* bind addr not known yet */
+			&connect_addr, &connect_addr_len,
+			errmsg, sizeof(errmsg));
+		if (ctrl_fd < 0) {
+			zend_throw_exception(spl_ce_RuntimeException, errmsg, 0);
 			RETURN_THROWS();
 		}
+		conn->socks5_ctrl_fd = ctrl_fd;
 	} else {
 		memcpy(&connect_addr, &peer_addr, peer_addr_len);
 		connect_addr_len = peer_addr_len;
@@ -815,6 +1087,12 @@ PHP_METHOD(QuicConnection, close)
 
 	int ret = SSL_shutdown_ex(conn->ssl, SSL_SHUTDOWN_FLAG_RAPID, &args, sizeof(args));
 	conn->connected = 0;
+
+	/* Close SOCKS5 TCP control socket — relay terminates when this closes */
+	if (conn->socks5_ctrl_fd >= 0) {
+		close(conn->socks5_ctrl_fd);
+		conn->socks5_ctrl_fd = -1;
+	}
 
 	RETURN_BOOL(ret >= 0);
 }
