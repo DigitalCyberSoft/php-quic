@@ -4,7 +4,7 @@
 extern zend_module_entry quic_module_entry;
 #define phpext_quic_ptr &quic_module_entry
 
-#define PHP_QUIC_VERSION "1.2.2"
+#define PHP_QUIC_VERSION "1.2.3"
 
 #ifdef PHP_WIN32
 # define PHP_QUIC_API __declspec(dllexport)

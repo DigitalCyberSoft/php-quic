@@ -171,6 +171,7 @@ static int socks5_handshake(const char *proxy_host, int proxy_port,
 	const char *username, const char *password,
 	struct sockaddr_storage *bind_addr, socklen_t bind_addr_len,
 	struct sockaddr_storage *relay_addr, socklen_t *relay_addr_len,
+	double timeout_secs,
 	char *errmsg, size_t errmsg_size)
 {
 	int tcp_fd = -1;
@@ -192,7 +193,9 @@ static int socks5_handshake(const char *proxy_host, int proxy_port,
 		return -1;
 	}
 
-	struct timeval tv = { .tv_sec = 30, .tv_usec = 0 };
+	struct timeval tv;
+	tv.tv_sec = (long)timeout_secs;
+	tv.tv_usec = (long)((timeout_secs - (double)tv.tv_sec) * 1000000.0);
 	setsockopt(tcp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 	setsockopt(tcp_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
@@ -412,6 +415,7 @@ typedef struct {
 	zend_bool verify_peer;
 	zend_bool verify_peer_name;
 	zend_bool allow_self_signed;
+	double timeout;  /* connect/SOCKS5 timeout in seconds */
 	uint32_t stream_count;
 	uint64_t bytes_sent;
 	uint64_t bytes_received;
@@ -629,6 +633,7 @@ static zend_object *quic_connection_create(zend_class_entry *ce)
 	conn->verify_peer = 1;
 	conn->verify_peer_name = 1;
 	conn->allow_self_signed = 0;
+	conn->timeout = 30.0;
 	conn->stream_count = 0;
 	conn->bytes_sent = 0;
 	conn->bytes_received = 0;
@@ -828,6 +833,15 @@ PHP_METHOD(QuicConnection, __construct)
 		if (opt_val && Z_TYPE_P(opt_val) == IS_STRING && Z_STRLEN_P(opt_val) > 0) {
 			conn->socks5_password = estrndup(Z_STRVAL_P(opt_val), Z_STRLEN_P(opt_val));
 		}
+
+		/* timeout - connect and SOCKS5 handshake timeout in seconds */
+		opt_val = zend_hash_str_find(Z_ARRVAL_P(options), "timeout", sizeof("timeout") - 1);
+		if (opt_val) {
+			conn->timeout = zval_get_double(opt_val);
+			if (conn->timeout <= 0) {
+				conn->timeout = 30.0;
+			}
+		}
 	}
 
 	/* Set verification mode */
@@ -855,7 +869,6 @@ PHP_METHOD(QuicConnection, connect)
 	BIO_ADDR *bio_addr = NULL;
 	BIO *bio = NULL;
 	int fd = -1;
-	double timeout_val = 30.0;
 	zend_long idle_timeout = 0;
 
 	ZEND_PARSE_PARAMETERS_NONE();
@@ -872,9 +885,7 @@ PHP_METHOD(QuicConnection, connect)
 		RETURN_THROWS();
 	}
 
-	/* Check for timeout option - need to re-read from constructor options
-	 * We stored the ctx, so check if we need to get timeout from the object.
-	 * For simplicity, use the default or parse from the zval stored. */
+	double timeout_val = conn->timeout;
 
 	/* Resolve the real target */
 	if (quic_resolve_host(conn->host, conn->port, &peer_addr, &peer_addr_len) != 0) {
@@ -920,6 +931,7 @@ PHP_METHOD(QuicConnection, connect)
 			conn->socks5_username, conn->socks5_password,
 			NULL, 0,  /* bind addr not known yet */
 			&connect_addr, &connect_addr_len,
+			conn->timeout,
 			errmsg, sizeof(errmsg));
 		if (ctrl_fd < 0) {
 			zend_throw_exception(spl_ce_RuntimeException, errmsg, 0);
