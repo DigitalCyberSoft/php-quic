@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <errno.h>
+#include <pthread.h>
 
 /* ----------------------------------------------------------------
  * Forward declarations
@@ -59,90 +60,134 @@ static int quic_resolve_host(const char *host, int port, struct sockaddr_storage
  * ---------------------------------------------------------------- */
 
 typedef struct {
+	int fd;                /* UDP socket fd (connected to relay) */
+	BIO *dgram;            /* real dgram BIO for ctrl delegation (NOT in chain) */
 	struct sockaddr_storage target_addr;
 	socklen_t target_addr_len;
 	uint8_t header[22]; /* max: 2 RSV + 1 FRAG + 1 ATYP + 16 IPv6 + 2 port = 22 */
 	size_t header_len;
 } socks5_bio_data;
 
-static int socks5_bio_write_ex(BIO *bio, const char *data, size_t datal, size_t *written)
+/* sendmmsg: prepend SOCKS5 UDP header and send via raw syscall */
+static int socks5_bio_sendmmsg(BIO *bio, BIO_MSG *msg, size_t stride,
+	size_t num_msg, uint64_t flags, size_t *msgs_processed)
 {
-	BIO *next = BIO_next(bio);
-	if (!next) return 0;
-
 	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
 
-	/* Prepend SOCKS5 UDP header to outgoing datagram */
-	size_t total = s5->header_len + datal;
-	char *buf = OPENSSL_malloc(total);
-	if (!buf) return 0;
+	for (size_t i = 0; i < num_msg; i++) {
+		BIO_MSG *m = (BIO_MSG *)((char *)msg + i * stride);
 
-	memcpy(buf, s5->header, s5->header_len);
-	memcpy(buf + s5->header_len, data, datal);
+		/* Build wrapped packet: SOCKS5 header + original data */
+		struct iovec iov[2];
+		iov[0].iov_base = s5->header;
+		iov[0].iov_len = s5->header_len;
+		iov[1].iov_base = m->data;
+		iov[1].iov_len = m->data_len;
 
-	int ret = BIO_write_ex(next, buf, total, written);
-	OPENSSL_free(buf);
+		struct msghdr mh = {0};
+		mh.msg_iov = iov;
+		mh.msg_iovlen = 2;
 
-	/* Adjust written count to exclude our header */
-	if (ret && *written >= s5->header_len)
-		*written -= s5->header_len;
+		ssize_t sent = sendmsg(s5->fd, &mh, 0);
+		if (sent < 0) {
+			*msgs_processed = i;
+			if (i > 0) return 1;
+			ERR_raise(ERR_LIB_SYS, errno);
+			return 0;
+		}
+	}
 
-	return ret;
+	*msgs_processed = num_msg;
+	return 1;
 }
 
-static int socks5_bio_read_ex(BIO *bio, char *data, size_t datal, size_t *readbytes)
+/* recvmmsg: receive via raw syscall and strip SOCKS5 UDP header */
+static int socks5_bio_recvmmsg(BIO *bio, BIO_MSG *msg, size_t stride,
+	size_t num_msg, uint64_t flags, size_t *msgs_processed)
 {
-	BIO *next = BIO_next(bio);
-	if (!next) return 0;
-
 	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
+	*msgs_processed = 0;
 
-	/* Read into a temp buffer large enough for header + payload */
-	size_t total = s5->header_len + datal;
-	char *buf = OPENSSL_malloc(total);
-	if (!buf) return 0;
+	for (size_t i = 0; i < num_msg; i++) {
+		BIO_MSG *m = (BIO_MSG *)((char *)msg + i * stride);
 
-	size_t got = 0;
-	int ret = BIO_read_ex(next, buf, total, &got);
-	if (!ret || got <= s5->header_len) {
+		/* Receive into a temp buffer with room for the SOCKS5 header */
+		size_t total = m->data_len + 22;
+		char *buf = OPENSSL_malloc(total);
+		if (!buf) return 0;
+
+		struct iovec iov = { .iov_base = buf, .iov_len = total };
+		struct msghdr mh = {0};
+		mh.msg_iov = &iov;
+		mh.msg_iovlen = 1;
+
+		ssize_t got = recvmsg(s5->fd, &mh, 0);
+		if (got <= 0) {
+			OPENSSL_free(buf);
+			if (i > 0) return 1; /* return what we already have */
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				BIO_set_retry_read(bio);
+				return 0;
+			}
+			return 0;
+		}
+
+		/* Parse SOCKS5 UDP header length */
+		size_t hdr_len = 0;
+		if ((size_t)got >= 4) {
+			uint8_t atyp = (uint8_t)buf[3];
+			if (atyp == 0x01)       hdr_len = 10;
+			else if (atyp == 0x04)  hdr_len = 22;
+			else if (atyp == 0x03 && (size_t)got >= 5) hdr_len = 4 + 1 + (uint8_t)buf[4] + 2;
+			else hdr_len = s5->header_len;
+		}
+
+		if ((size_t)got > hdr_len) {
+			size_t payload_len = (size_t)got - hdr_len;
+			if (payload_len > m->data_len) payload_len = m->data_len;
+			memcpy(m->data, buf + hdr_len, payload_len);
+			m->data_len = payload_len;
+		} else {
+			m->data_len = 0;
+		}
+
 		OPENSSL_free(buf);
-		*readbytes = 0;
-		return ret;
+		*msgs_processed = i + 1;
 	}
 
-	/* Strip SOCKS5 UDP header — the header length varies by ATYP in the response,
-	 * but for simplicity parse the actual response header */
-	size_t resp_hdr_len = 0;
-	if (got >= 4) {
-		uint8_t atyp = (uint8_t)buf[3];
-		if (atyp == 0x01)       resp_hdr_len = 10; /* IPv4: 2+1+1+4+2 */
-		else if (atyp == 0x04)  resp_hdr_len = 22; /* IPv6: 2+1+1+16+2 */
-		else if (atyp == 0x03 && got >= 5) resp_hdr_len = 4 + 1 + (uint8_t)buf[4] + 2; /* domain */
-		else resp_hdr_len = s5->header_len; /* fallback */
-	} else {
-		resp_hdr_len = s5->header_len;
-	}
-
-	if (got <= resp_hdr_len) {
-		OPENSSL_free(buf);
-		*readbytes = 0;
-		return ret;
-	}
-
-	size_t payload_len = got - resp_hdr_len;
-	if (payload_len > datal) payload_len = datal;
-	memcpy(data, buf + resp_hdr_len, payload_len);
-	*readbytes = payload_len;
-
-	OPENSSL_free(buf);
-	return ret;
+	return 1;
 }
 
 static long socks5_bio_ctrl(BIO *bio, int cmd, long larg, void *parg)
 {
-	BIO *next = BIO_next(bio);
-	if (!next) return 0;
-	return BIO_ctrl(next, cmd, larg, parg);
+	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
+	if (!s5) return 0;
+
+	/* Delegate ctrl to the real dgram BIO (stored privately, NOT in chain) */
+	if (s5->dgram) {
+		long ret = BIO_ctrl(s5->dgram, cmd, larg, parg);
+		return ret;
+	}
+
+	/* Minimal fallback */
+	switch (cmd) {
+		case BIO_C_GET_FD:
+			if (parg) *(int *)parg = s5->fd;
+			return s5->fd;
+		case BIO_CTRL_GET_RPOLL_DESCRIPTOR:
+		case BIO_CTRL_GET_WPOLL_DESCRIPTOR: {
+			BIO_POLL_DESCRIPTOR *desc = (BIO_POLL_DESCRIPTOR *)parg;
+			if (desc) {
+				desc->type = BIO_POLL_DESCRIPTOR_TYPE_SOCK_FD;
+				desc->value.fd = s5->fd;
+			}
+			return 1;
+		}
+		case BIO_CTRL_FLUSH:
+			return 1;
+		default:
+			return 0;
+	}
 }
 
 static int socks5_bio_create(BIO *bio)
@@ -156,6 +201,8 @@ static int socks5_bio_destroy(BIO *bio)
 	if (bio) {
 		socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
 		if (s5) {
+			if (s5->dgram)
+				BIO_free(s5->dgram);
 			OPENSSL_free(s5);
 			BIO_set_data(bio, NULL);
 		}
@@ -168,10 +215,10 @@ static BIO_METHOD *socks5_bio_method = NULL;
 static BIO_METHOD *get_socks5_bio_method(void)
 {
 	if (!socks5_bio_method) {
-		socks5_bio_method = BIO_meth_new(BIO_TYPE_FILTER | BIO_get_new_index(),
-			"socks5_udp_filter");
-		BIO_meth_set_write_ex(socks5_bio_method, socks5_bio_write_ex);
-		BIO_meth_set_read_ex(socks5_bio_method, socks5_bio_read_ex);
+		socks5_bio_method = BIO_meth_new(BIO_TYPE_DGRAM,
+			"socks5_dgram");
+		BIO_meth_set_sendmmsg(socks5_bio_method, socks5_bio_sendmmsg);
+		BIO_meth_set_recvmmsg(socks5_bio_method, socks5_bio_recvmmsg);
 		BIO_meth_set_ctrl(socks5_bio_method, socks5_bio_ctrl);
 		BIO_meth_set_create(socks5_bio_method, socks5_bio_create);
 		BIO_meth_set_destroy(socks5_bio_method, socks5_bio_destroy);
@@ -199,6 +246,87 @@ static size_t socks5_build_header(uint8_t *header, struct sockaddr_storage *addr
 		memcpy(header + 20, &sin6->sin6_port, 2);
 		return 22;
 	}
+}
+
+/* ----------------------------------------------------------------
+ * SOCKS5 UDP forwarder thread
+ *
+ * Bidirectional relay between a local Unix datagram socket (connected
+ * to OpenSSL) and the SOCKS5 UDP relay socket. Outgoing: prepend
+ * SOCKS5 header. Incoming: strip SOCKS5 header.
+ * ---------------------------------------------------------------- */
+
+typedef struct {
+	int local_fd;   /* Unix dgram socket — OpenSSL side */
+	int relay_fd;   /* UDP socket — connected to SOCKS5 relay */
+	uint8_t header[22];
+	size_t header_len;
+	volatile int running;
+} socks5_fwd_t;
+
+void *socks5_forwarder(void *arg)
+{
+	socks5_fwd_t *fwd = (socks5_fwd_t *)arg;
+	char buf[65536];
+	struct pollfd pfds[2];
+
+	pfds[0].fd = fwd->local_fd;
+	pfds[0].events = POLLIN;
+	pfds[1].fd = fwd->relay_fd;
+	pfds[1].events = POLLIN;
+
+	while (fwd->running) {
+		int ret = poll(pfds, 2, 1000); /* 1 second poll timeout */
+		if (ret <= 0) continue;
+
+		/* OpenSSL -> relay: prepend SOCKS5 header */
+		if (pfds[0].revents & POLLIN) {
+			ssize_t n = recv(fwd->local_fd, buf, sizeof(buf), 0);
+			if (n > 0) {
+				struct iovec iov[2];
+				iov[0].iov_base = fwd->header;
+				iov[0].iov_len = fwd->header_len;
+				iov[1].iov_base = buf;
+				iov[1].iov_len = (size_t)n;
+				struct msghdr mh = {0};
+				mh.msg_iov = iov;
+				mh.msg_iovlen = 2;
+				sendmsg(fwd->relay_fd, &mh, 0);
+			} else if (n == 0) {
+				break; /* local socket closed */
+			}
+		}
+
+		/* Relay -> OpenSSL: strip SOCKS5 header */
+		if (pfds[1].revents & POLLIN) {
+			ssize_t n = recv(fwd->relay_fd, buf, sizeof(buf), 0);
+			if (n > 0) {
+				/* Parse SOCKS5 UDP response header */
+				size_t hdr_len = 0;
+				if ((size_t)n >= 4) {
+					uint8_t atyp = (uint8_t)buf[3];
+					if (atyp == 0x01) hdr_len = 10;
+					else if (atyp == 0x04) hdr_len = 22;
+					else if (atyp == 0x03 && (size_t)n >= 5) hdr_len = 4 + 1 + (uint8_t)buf[4] + 2;
+					else hdr_len = fwd->header_len;
+				}
+				if ((size_t)n > hdr_len) {
+					send(fwd->local_fd, buf + hdr_len, (size_t)n - hdr_len, 0);
+				}
+			} else if (n == 0) {
+				break; /* relay closed */
+			}
+		}
+
+		/* Check for errors/hangup */
+		if ((pfds[0].revents & (POLLERR | POLLHUP)) ||
+			(pfds[1].revents & (POLLERR | POLLHUP))) {
+			break;
+		}
+	}
+
+	fwd->running = 0;
+	return NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -450,6 +578,7 @@ typedef struct {
 	char *socks5_username;
 	char *socks5_password;
 	int socks5_ctrl_fd;  /* TCP control socket — must stay open for relay lifetime */
+	socks5_fwd_t *socks5_fwd;  /* forwarder thread state */
 	zend_bool connected;
 	zend_bool verify_peer;
 	zend_bool verify_peer_name;
@@ -630,6 +759,14 @@ static void quic_connection_free(zend_object *object)
 		efree(conn->socks5_password);
 		conn->socks5_password = NULL;
 	}
+	if (conn->socks5_fwd) {
+		conn->socks5_fwd->running = 0;
+		close(conn->socks5_fwd->local_fd);
+		close(conn->socks5_fwd->relay_fd);
+		usleep(10000);
+		OPENSSL_free(conn->socks5_fwd);
+		conn->socks5_fwd = NULL;
+	}
 	if (conn->socks5_ctrl_fd >= 0) {
 		close(conn->socks5_ctrl_fd);
 		conn->socks5_ctrl_fd = -1;
@@ -655,6 +792,7 @@ static zend_object *quic_connection_create(zend_class_entry *ce)
 	conn->socks5_username = NULL;
 	conn->socks5_password = NULL;
 	conn->socks5_ctrl_fd = -1;
+	conn->socks5_fwd = NULL;
 	conn->port = 0;
 	conn->connected = 0;
 	conn->verify_peer = 1;
@@ -1010,29 +1148,74 @@ PHP_METHOD(QuicConnection, connect)
 		RETURN_THROWS();
 	}
 
-	/* If SOCKS5, insert BIO filter that wraps/unwraps UDP relay headers */
+	/* If SOCKS5, we use a UDP socketpair trick:
+	 * - Create a local UDP socketpair
+	 * - Give one end to OpenSSL's dgram BIO (so QUIC works natively)
+	 * - Spawn a forwarder thread on the other end that wraps/unwraps
+	 *   SOCKS5 UDP headers and relays to/from the real proxy relay
+	 *
+	 * This avoids fighting OpenSSL's internal BIO handling entirely. */
 	if (conn->socks5_proxy) {
-		BIO *filter = BIO_new(get_socks5_bio_method());
-		if (!filter) {
+		int pair[2];
+		if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0) {
 			BIO_ADDR_free(bio_addr);
 			BIO_free(bio);
 			close(fd);
-			zend_throw_exception(spl_ce_RuntimeException,
-				"Failed to create SOCKS5 BIO filter", 0);
+			zend_throw_exception_ex(spl_ce_RuntimeException, 0,
+				"Failed to create socketpair: %s", strerror(errno));
 			RETURN_THROWS();
 		}
 
-		socks5_bio_data *s5 = OPENSSL_zalloc(sizeof(socks5_bio_data));
-		memcpy(&s5->target_addr, &peer_addr, peer_addr_len);
-		s5->target_addr_len = peer_addr_len;
-		s5->header_len = socks5_build_header(s5->header, &peer_addr);
-		BIO_set_data(filter, s5);
+		/* pair[0] = OpenSSL's side (replace fd in dgram BIO)
+		 * pair[1] = our forwarder's side */
 
-		/* Chain: SSL -> socks5_filter -> dgram_bio */
-		bio = BIO_push(filter, bio);
+		/* Close the original dgram BIO and create a new one on pair[0] */
+		BIO_free(bio);
+		bio = BIO_new_dgram(pair[0], BIO_NOCLOSE);
+		if (!bio) {
+			close(pair[0]); close(pair[1]); close(fd);
+			quic_throw_ssl_error("Failed to create dgram BIO for socketpair");
+			RETURN_THROWS();
+		}
+
+		/* "Connect" pair[0] so sendmsg/recvmsg works without address */
+		/* socketpair is already connected */
+
+		/* Build SOCKS5 header for the target */
+		uint8_t s5_header[22];
+		size_t s5_header_len = socks5_build_header(s5_header, &peer_addr);
+
+		/* Start forwarder thread */
+		socks5_fwd_t *fwd = OPENSSL_zalloc(sizeof(socks5_fwd_t));
+		fwd->local_fd = pair[1];
+		fwd->relay_fd = fd;
+		memcpy(fwd->header, s5_header, s5_header_len);
+		fwd->header_len = s5_header_len;
+		fwd->running = 1;
+
+		/* Forwarder runs in a thread — forwards in both directions */
+		pthread_t fwd_thread;
+		if (pthread_create(&fwd_thread, NULL, socks5_forwarder, fwd) != 0) {
+			OPENSSL_free(fwd);
+			BIO_free(bio);
+			close(pair[0]); close(pair[1]); close(fd);
+			zend_throw_exception(spl_ce_RuntimeException,
+				"Failed to create SOCKS5 forwarder thread", 0);
+			RETURN_THROWS();
+		}
+		pthread_detach(fwd_thread);
+
+		/* Store forwarder for cleanup */
+		conn->socks5_fwd = fwd;
+
+		/* Update conn->fd to the OpenSSL-side socket */
+		conn->fd = pair[0];
+		/* Keep the relay fd open — the thread uses it */
+
+		SSL_set_bio(conn->ssl, bio, bio);
+	} else {
+		SSL_set_bio(conn->ssl, bio, bio);
 	}
-
-	SSL_set_bio(conn->ssl, bio, bio);
 	conn->fd = fd;
 
 	/* Set initial peer address for QUIC */
