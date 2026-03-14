@@ -14,6 +14,19 @@
 #include "ext/spl/spl_exceptions.h"
 #include "php_quic.h"
 
+/* PHP 7.4 compatibility */
+#if PHP_VERSION_ID < 80000
+# define RETURN_THROWS() return
+# define zend_ce_value_error spl_ce_InvalidArgumentException
+#endif
+#ifndef ZEND_ACC_NO_DYNAMIC_PROPERTIES
+# define ZEND_ACC_NO_DYNAMIC_PROPERTIES 0
+#endif
+#ifndef ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE
+# define ZEND_ARG_TYPE_INFO_WITH_DEFAULT_VALUE(pass_by_ref, name, type_hint, allow_null, default_value) \
+	ZEND_ARG_TYPE_INFO(pass_by_ref, name, type_hint, allow_null)
+#endif
+
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/quic.h>
