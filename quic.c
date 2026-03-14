@@ -53,179 +53,6 @@ static zend_object_handlers quic_stream_handlers;
 
 static int quic_resolve_host(const char *host, int port, struct sockaddr_storage *addr, socklen_t *addrlen);
 
-/* ----------------------------------------------------------------
- * SOCKS5 UDP relay BIO filter
- * Wraps outgoing datagrams with RFC 1928 UDP header, strips on receive.
- * Header: 2 bytes RSV (0x0000) + 1 byte FRAG (0x00) + ATYP + DST.ADDR + DST.PORT
- * ---------------------------------------------------------------- */
-
-typedef struct {
-	int fd;                /* UDP socket fd (connected to relay) */
-	BIO *dgram;            /* real dgram BIO for ctrl delegation (NOT in chain) */
-	struct sockaddr_storage target_addr;
-	socklen_t target_addr_len;
-	uint8_t header[22]; /* max: 2 RSV + 1 FRAG + 1 ATYP + 16 IPv6 + 2 port = 22 */
-	size_t header_len;
-} socks5_bio_data;
-
-/* sendmmsg: prepend SOCKS5 UDP header and send via raw syscall */
-static int socks5_bio_sendmmsg(BIO *bio, BIO_MSG *msg, size_t stride,
-	size_t num_msg, uint64_t flags, size_t *msgs_processed)
-{
-	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
-
-	for (size_t i = 0; i < num_msg; i++) {
-		BIO_MSG *m = (BIO_MSG *)((char *)msg + i * stride);
-
-		/* Build wrapped packet: SOCKS5 header + original data */
-		struct iovec iov[2];
-		iov[0].iov_base = s5->header;
-		iov[0].iov_len = s5->header_len;
-		iov[1].iov_base = m->data;
-		iov[1].iov_len = m->data_len;
-
-		struct msghdr mh = {0};
-		mh.msg_iov = iov;
-		mh.msg_iovlen = 2;
-
-		ssize_t sent = sendmsg(s5->fd, &mh, 0);
-		if (sent < 0) {
-			*msgs_processed = i;
-			if (i > 0) return 1;
-			ERR_raise(ERR_LIB_SYS, errno);
-			return 0;
-		}
-	}
-
-	*msgs_processed = num_msg;
-	return 1;
-}
-
-/* recvmmsg: receive via raw syscall and strip SOCKS5 UDP header */
-static int socks5_bio_recvmmsg(BIO *bio, BIO_MSG *msg, size_t stride,
-	size_t num_msg, uint64_t flags, size_t *msgs_processed)
-{
-	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
-	*msgs_processed = 0;
-
-	for (size_t i = 0; i < num_msg; i++) {
-		BIO_MSG *m = (BIO_MSG *)((char *)msg + i * stride);
-
-		/* Receive into a temp buffer with room for the SOCKS5 header */
-		size_t total = m->data_len + 22;
-		char *buf = OPENSSL_malloc(total);
-		if (!buf) return 0;
-
-		struct iovec iov = { .iov_base = buf, .iov_len = total };
-		struct msghdr mh = {0};
-		mh.msg_iov = &iov;
-		mh.msg_iovlen = 1;
-
-		ssize_t got = recvmsg(s5->fd, &mh, 0);
-		if (got <= 0) {
-			OPENSSL_free(buf);
-			if (i > 0) return 1; /* return what we already have */
-			if (errno == EAGAIN || errno == EWOULDBLOCK) {
-				BIO_set_retry_read(bio);
-				return 0;
-			}
-			return 0;
-		}
-
-		/* Parse SOCKS5 UDP header length */
-		size_t hdr_len = 0;
-		if ((size_t)got >= 4) {
-			uint8_t atyp = (uint8_t)buf[3];
-			if (atyp == 0x01)       hdr_len = 10;
-			else if (atyp == 0x04)  hdr_len = 22;
-			else if (atyp == 0x03 && (size_t)got >= 5) hdr_len = 4 + 1 + (uint8_t)buf[4] + 2;
-			else hdr_len = s5->header_len;
-		}
-
-		if ((size_t)got > hdr_len) {
-			size_t payload_len = (size_t)got - hdr_len;
-			if (payload_len > m->data_len) payload_len = m->data_len;
-			memcpy(m->data, buf + hdr_len, payload_len);
-			m->data_len = payload_len;
-		} else {
-			m->data_len = 0;
-		}
-
-		OPENSSL_free(buf);
-		*msgs_processed = i + 1;
-	}
-
-	return 1;
-}
-
-static long socks5_bio_ctrl(BIO *bio, int cmd, long larg, void *parg)
-{
-	socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
-	if (!s5) return 0;
-
-	/* Delegate ctrl to the real dgram BIO (stored privately, NOT in chain) */
-	if (s5->dgram) {
-		long ret = BIO_ctrl(s5->dgram, cmd, larg, parg);
-		return ret;
-	}
-
-	/* Minimal fallback */
-	switch (cmd) {
-		case BIO_C_GET_FD:
-			if (parg) *(int *)parg = s5->fd;
-			return s5->fd;
-		case BIO_CTRL_GET_RPOLL_DESCRIPTOR:
-		case BIO_CTRL_GET_WPOLL_DESCRIPTOR: {
-			BIO_POLL_DESCRIPTOR *desc = (BIO_POLL_DESCRIPTOR *)parg;
-			if (desc) {
-				desc->type = BIO_POLL_DESCRIPTOR_TYPE_SOCK_FD;
-				desc->value.fd = s5->fd;
-			}
-			return 1;
-		}
-		case BIO_CTRL_FLUSH:
-			return 1;
-		default:
-			return 0;
-	}
-}
-
-static int socks5_bio_create(BIO *bio)
-{
-	BIO_set_init(bio, 1);
-	return 1;
-}
-
-static int socks5_bio_destroy(BIO *bio)
-{
-	if (bio) {
-		socks5_bio_data *s5 = (socks5_bio_data *)BIO_get_data(bio);
-		if (s5) {
-			if (s5->dgram)
-				BIO_free(s5->dgram);
-			OPENSSL_free(s5);
-			BIO_set_data(bio, NULL);
-		}
-	}
-	return 1;
-}
-
-static BIO_METHOD *socks5_bio_method = NULL;
-
-static BIO_METHOD *get_socks5_bio_method(void)
-{
-	if (!socks5_bio_method) {
-		socks5_bio_method = BIO_meth_new(BIO_TYPE_DGRAM,
-			"socks5_dgram");
-		BIO_meth_set_sendmmsg(socks5_bio_method, socks5_bio_sendmmsg);
-		BIO_meth_set_recvmmsg(socks5_bio_method, socks5_bio_recvmmsg);
-		BIO_meth_set_ctrl(socks5_bio_method, socks5_bio_ctrl);
-		BIO_meth_set_create(socks5_bio_method, socks5_bio_create);
-		BIO_meth_set_destroy(socks5_bio_method, socks5_bio_destroy);
-	}
-	return socks5_bio_method;
-}
-
 /* Build the SOCKS5 UDP header for a given target sockaddr */
 static size_t socks5_build_header(uint8_t *header, struct sockaddr_storage *addr)
 {
@@ -261,7 +88,8 @@ typedef struct {
 	int relay_fd;   /* UDP socket — connected to SOCKS5 relay */
 	uint8_t header[22];
 	size_t header_len;
-	volatile int running;
+	int running;    /* accessed via __atomic builtins */
+	pthread_t thread;
 } socks5_fwd_t;
 
 void *socks5_forwarder(void *arg)
@@ -275,7 +103,7 @@ void *socks5_forwarder(void *arg)
 	pfds[1].fd = fwd->relay_fd;
 	pfds[1].events = POLLIN;
 
-	while (fwd->running) {
+	while (__atomic_load_n(&fwd->running, __ATOMIC_ACQUIRE)) {
 		int ret = poll(pfds, 2, 1000); /* 1 second poll timeout */
 		if (ret <= 0) continue;
 
@@ -325,7 +153,7 @@ void *socks5_forwarder(void *arg)
 		}
 	}
 
-	fwd->running = 0;
+	__atomic_store_n(&fwd->running, 0, __ATOMIC_RELEASE);
 	return NULL;
 }
 
@@ -348,7 +176,7 @@ static int socks5_handshake(const char *proxy_host, int proxy_port,
 	int tcp_fd = -1;
 	struct sockaddr_storage proxy_addr;
 	socklen_t proxy_addr_len;
-	uint8_t buf[512];
+	uint8_t buf[515]; /* max auth packet: 1 + 1 + 255 + 1 + 255 = 513 */
 	ssize_t n;
 
 	/* Resolve proxy */
@@ -483,6 +311,7 @@ static int socks5_handshake(const char *proxy_host, int proxy_port,
 			case 0x03: reason = "network unreachable"; break;
 			case 0x04: reason = "host unreachable"; break;
 			case 0x05: reason = "connection refused"; break;
+			case 0x06: reason = "TTL expired"; break;
 			case 0x07: reason = "command not supported"; break;
 			case 0x08: reason = "address type not supported"; break;
 			default:   reason = "unknown error"; break;
@@ -756,14 +585,16 @@ static void quic_connection_free(zend_object *object)
 		conn->socks5_username = NULL;
 	}
 	if (conn->socks5_password) {
+		memset(conn->socks5_password, 0, strlen(conn->socks5_password));
 		efree(conn->socks5_password);
 		conn->socks5_password = NULL;
 	}
 	if (conn->socks5_fwd) {
-		conn->socks5_fwd->running = 0;
+		__atomic_store_n(&conn->socks5_fwd->running, 0, __ATOMIC_RELEASE);
+		/* Close sockets to unblock poll(), then join thread */
 		close(conn->socks5_fwd->local_fd);
 		close(conn->socks5_fwd->relay_fd);
-		usleep(10000);
+		pthread_join(conn->socks5_fwd->thread, NULL);
 		OPENSSL_free(conn->socks5_fwd);
 		conn->socks5_fwd = NULL;
 	}
@@ -1060,9 +891,14 @@ PHP_METHOD(QuicConnection, connect)
 
 	if (conn->socks5_proxy) {
 		/* Parse proxy "host:port" */
+		size_t proxy_len = strlen(conn->socks5_proxy);
+		if (proxy_len >= 256) {
+			zend_throw_exception(spl_ce_RuntimeException,
+				"socks5_proxy value too long (max 255 characters)", 0);
+			RETURN_THROWS();
+		}
 		char proxy_buf[256];
-		strncpy(proxy_buf, conn->socks5_proxy, sizeof(proxy_buf) - 1);
-		proxy_buf[sizeof(proxy_buf) - 1] = '\0';
+		memcpy(proxy_buf, conn->socks5_proxy, proxy_len + 1);
 		char *colon = strrchr(proxy_buf, ':');
 		if (!colon) {
 			zend_throw_exception(spl_ce_RuntimeException,
@@ -1070,7 +906,12 @@ PHP_METHOD(QuicConnection, connect)
 			RETURN_THROWS();
 		}
 		*colon = '\0';
-		int proxy_port = atoi(colon + 1);
+		long proxy_port = strtol(colon + 1, NULL, 10);
+		if (proxy_port < 1 || proxy_port > 65535) {
+			zend_throw_exception(spl_ce_RuntimeException,
+				"Invalid socks5_proxy port, must be between 1 and 65535", 0);
+			RETURN_THROWS();
+		}
 
 		/* Perform SOCKS5 TCP handshake + UDP ASSOCIATE */
 		char errmsg[512];
@@ -1194,8 +1035,7 @@ PHP_METHOD(QuicConnection, connect)
 		fwd->running = 1;
 
 		/* Forwarder runs in a thread — forwards in both directions */
-		pthread_t fwd_thread;
-		if (pthread_create(&fwd_thread, NULL, socks5_forwarder, fwd) != 0) {
+		if (pthread_create(&fwd->thread, NULL, socks5_forwarder, fwd) != 0) {
 			OPENSSL_free(fwd);
 			BIO_free(bio);
 			close(pair[0]); close(pair[1]); close(fd);
@@ -1203,20 +1043,18 @@ PHP_METHOD(QuicConnection, connect)
 				"Failed to create SOCKS5 forwarder thread", 0);
 			RETURN_THROWS();
 		}
-		pthread_detach(fwd_thread);
 
 		/* Store forwarder for cleanup */
 		conn->socks5_fwd = fwd;
 
-		/* Update conn->fd to the OpenSSL-side socket */
+		/* conn->fd = OpenSSL-side socket; relay fd owned by forwarder */
 		conn->fd = pair[0];
-		/* Keep the relay fd open — the thread uses it */
 
 		SSL_set_bio(conn->ssl, bio, bio);
 	} else {
 		SSL_set_bio(conn->ssl, bio, bio);
+		conn->fd = fd;
 	}
-	conn->fd = fd;
 
 	/* Set initial peer address for QUIC */
 	/* With a connected UDP socket, we set the peer addr from sockaddr */
@@ -2116,10 +1954,6 @@ PHP_MINIT_FUNCTION(quic)
 
 PHP_MSHUTDOWN_FUNCTION(quic)
 {
-	if (socks5_bio_method) {
-		BIO_meth_free(socks5_bio_method);
-		socks5_bio_method = NULL;
-	}
 	return SUCCESS;
 }
 

@@ -25,6 +25,15 @@ libtool
 build/
 run-tests.php
 
+# Test runner artifacts
+tests/*.sh
+tests/*.log
+tests/*.out
+tests/*.exp
+tests/*.diff
+tests/*.php
+tmp-php.ini
+
 # Editor/IDE
 *.swp
 *.swo

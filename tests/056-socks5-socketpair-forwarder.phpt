@@ -1,5 +1,5 @@
 --TEST--
-QuicConnection SOCKS5 proxy functional (TCP handshake + UDP relay)
+SOCKS5 socketpair forwarder: full H3 connection through proxy
 --EXTENSIONS--
 quic
 --SKIPIF--
@@ -10,35 +10,23 @@ if (!file_exists('/usr/bin/3proxy')) die("skip 3proxy not available");
 <?php
 
 $port = rand(30000, 39999);
-$logfile = "/tmp/3proxy-test-038-$port.log";
-$cfgfile = "/tmp/3proxy-test-038-$port.cfg";
+$logfile = "/tmp/3proxy-test-056-$port.log";
+$cfgfile = "/tmp/3proxy-test-056-$port.cfg";
 file_put_contents($cfgfile, "log $logfile\nsocks -p$port\n");
 $proc = proc_open("3proxy $cfgfile", [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
 if (!$proc) die("FAIL: could not start 3proxy\n");
 usleep(300000);
 
-// Verify proxy is listening
-$sock = @stream_socket_client("tcp://127.0.0.1:$port", $errno, $errstr, 2);
-if (!$sock) {
-    echo "FAIL: proxy not listening\n";
-    proc_terminate($proc);
-    proc_close($proc);
-    exit(1);
-}
-fclose($sock);
-
-// Connect through the SOCKS5 proxy
 try {
     $conn = quic_connect("www.cloudflare.com", 443, [
         "alpn" => ["h3"],
         "peer_name" => "www.cloudflare.com",
-        "verify_peer" => true,
         "timeout" => 10,
+        "verify_peer" => true,
         "socks5_proxy" => "127.0.0.1:$port",
     ]);
-    echo "SOCKS5 connect: " . ($conn->isConnected() ? "connected" : "failed") . "\n";
+    echo "Connected: " . ($conn->isConnected() ? "yes" : "no") . "\n";
     echo "ALPN: " . $conn->getAlpn() . "\n";
-
     $conn->close();
     echo "Closed: " . ($conn->isConnected() ? "still connected" : "disconnected") . "\n";
 } catch (RuntimeException $e) {
@@ -57,7 +45,7 @@ echo "Proxy log has UDPMAP: " . (strpos($log, 'UDPMAP') !== false ? "yes" : "no"
 echo "OK\n";
 ?>
 --EXPECT--
-SOCKS5 connect: connected
+Connected: yes
 ALPN: h3
 Closed: disconnected
 Proxy log has UDPMAP: yes
